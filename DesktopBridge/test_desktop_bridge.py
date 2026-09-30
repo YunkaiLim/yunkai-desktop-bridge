@@ -840,7 +840,7 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def test_secure_secret_input_can_target_password_field_without_logging_secret(self):
         reset_action_audit_for_tests()
-        secret = "dummy-test-never-log-this-value"
+        secret = "unit-test-secret-" + ("y" * 24)
         bridge = FakeUIABridge(
             [
                 {
@@ -1167,5 +1167,418 @@ class DesktopBridgeTests(unittest.TestCase):
         result = bridge.click_active_window_uia_element_verified(
             "Notepad",
             name="Delete",
+            control_type="button",
+            automation_id="delete-button",
+            execution_mode="fast",
+            settle_ms=50,
+        )
+        self.assertEqual(result["execution_mode_requested"], "fast")
+        self.assertEqual(result["execution_mode_used"], "safe")
+        self.assertEqual(result["fast_path_fallback_reason"], "sensitive_selector:delete")
+        self.assertEqual(bridge.fast_context_calls, [(80, True)])
+        self.assertEqual(bridge.safe_semantic_click_calls, 1)
+        self.assertTrue(result["verification_passed"])
 
-[Showing lines 1-1169 of 1585 (50.0KB limit). Use offset=1170 to continue.]
+    def test_verified_click_defaults_to_safe_path(self):
+        reset_action_audit_for_tests()
+        bridge = FakeFastPathBridge()
+        result = bridge.click_active_window_uia_element_verified(
+            "Notepad",
+            name="Generate",
+            control_type="button",
+            automation_id="generate-button",
+            settle_ms=50,
+        )
+        self.assertEqual(result["execution_mode_requested"], "safe")
+        self.assertEqual(result["execution_mode_used"], "safe")
+        self.assertIsNone(result["fast_path_fallback_reason"])
+        self.assertEqual(bridge.fast_context_calls, [(80, True)])
+        self.assertEqual(bridge.safe_semantic_click_calls, 1)
+
+    def test_fast_path_refuses_invalid_execution_mode_before_input(self):
+        reset_action_audit_for_tests()
+        bridge = FakeFastPathBridge()
+        with self.assertRaisesRegex(DesktopBridgeError, "Unsupported execution_mode"):
+            bridge.click_active_window_uia_element_verified(
+                "Notepad",
+                name="Generate",
+                control_type="button",
+                automation_id="generate-button",
+                execution_mode="turbo",
+                settle_ms=50,
+            )
+        self.assertEqual(bridge.events, [])
+
+    def test_verified_uia_text_reports_no_change_without_retry(self):
+        reset_action_audit_for_tests()
+        bridge = FakeTransactionalBridge(changed=False)
+        result = bridge.type_active_window_uia_text_verified(
+            "hello",
+            "Notepad",
+            name="Editor",
+            replace_existing=True,
+            settle_ms=50,
+        )
+        self.assertFalse(result["verification_passed"])
+        self.assertFalse(result["retry_performed"])
+        self.assertEqual(result["audit"]["outcome"], "verification_failed")
+        self.assertEqual([event[0] for event in bridge.events], ["type", "verify"])
+        with self.assertRaises(DesktopBridgeError):
+            bridge.type_active_window_uia_text_verified("x", "Notepad", name="Editor", settle_ms=10)
+
+    def test_verified_text_audit_never_stores_text_content(self):
+        reset_action_audit_for_tests()
+        secret = "do-not-store-this-text"
+        bridge = FakeTransactionalBridge(changed=True)
+        bridge.type_active_window_uia_text_verified(
+            secret,
+            "Notepad",
+            name="Editor",
+            replace_existing=True,
+            settle_ms=50,
+        )
+        audit = bridge.recent_action_audit(limit=5)
+        self.assertEqual(audit["storage"], "memory_only_ring_buffer")
+        self.assertEqual(audit["returned_count"], 1)
+        entry = audit["entries"][0]
+        self.assertEqual(entry["input_metadata"]["text_length"], len(secret))
+        self.assertNotIn(secret, repr(audit))
+        self.assertNotIn("text", entry["input_metadata"])
+        self.assertGreaterEqual(audit["permission_returned_count"], 1)
+
+    def test_refused_verified_action_is_audited_without_retry(self):
+        reset_action_audit_for_tests()
+        bridge = FakeRefusingTransactionalBridge(changed=True)
+        with self.assertRaisesRegex(DesktopBridgeError, "selector refused"):
+            bridge.click_active_window_uia_element_verified(
+                "Notepad",
+                name="Save",
+                control_type="button",
+                settle_ms=50,
+            )
+        self.assertEqual([event[0] for event in bridge.events], ["click_refused"])
+        audit = bridge.recent_action_audit(limit=5)
+        self.assertEqual(audit["entries"][0]["outcome"], "refused")
+        self.assertFalse(audit["entries"][0]["retry_performed"])
+
+    def test_stricter_policy_can_reject_generic_state_change(self):
+        reset_action_audit_for_tests()
+        bridge = FakeTransactionalBridge(changed=True)
+        result = bridge.click_active_window_uia_element_verified(
+            "Notepad",
+            name="Save",
+            control_type="button",
+            settle_ms=50,
+            verification_policy="semantic_only",
+        )
+        self.assertFalse(result["verification_passed"])
+        self.assertEqual(result["audit"]["outcome"], "verification_failed")
+
+    def test_safe_key_allowlist_has_no_delete_or_system_keys(self):
+        self.assertIn("ENTER", SAFE_KEYS)
+        self.assertNotIn("DELETE", SAFE_KEYS)
+        self.assertNotIn("PRINTSCREEN", SAFE_KEYS)
+        self.assertNotIn("LWIN", SAFE_KEYS)
+
+    def test_safe_hotkeys_exclude_run_dialog_and_destructive_combos(self):
+        self.assertIn("CTRL+C", SAFE_HOTKEYS)
+        self.assertIn("ALT+TAB", SAFE_HOTKEYS)
+        self.assertNotIn("WIN+R", SAFE_HOTKEYS)
+        self.assertNotIn("ALT+F4", SAFE_HOTKEYS)
+        self.assertNotIn("CTRL+ALT+DELETE", SAFE_HOTKEYS)
+
+    def test_game_key_allowlist_excludes_system_keys(self):
+        for key in (
+            "W", "A", "S", "D", "SPACE", "SHIFT", "E", "Q", "F", "1", "2", "3", "4",
+            "ENTER", "ESCAPE", "TAB", "F1", "F2", "F3", "F4",
+        ):
+            self.assertIn(key, SAFE_GAME_KEYS)
+        for key in ("CTRL", "ALT", "WIN", "DELETE", "PRINTSCREEN"):
+            self.assertNotIn(key, SAFE_GAME_KEYS)
+
+    def test_runtime_profile_defaults_to_standard_and_blocks_game_input(self):
+        bridge = FakeGuardedBridge()
+        self.assertEqual(bridge.runtime_profile(), "standard")
+        policy = bridge.runtime_policy()
+        self.assertEqual(policy["allowed_tiers"], ["observe", "interact"])
+        with self.assertRaisesRegex(DesktopBridgeError, "does not permit elevated_input"):
+            bridge._require_permission_tier("elevated_input", action="test_game")
+
+    def test_runtime_permission_allow_and_deny_decisions_are_audited(self):
+        reset_action_audit_for_tests()
+        bridge = FakeGuardedBridge()
+        allowed = bridge._require_permission_tier("interact", action="unit_interact")
+        self.assertTrue(allowed["allowed"])
+        with self.assertRaisesRegex(DesktopBridgeError, "does not permit elevated_input"):
+            bridge._require_permission_tier("elevated_input", action="unit_game")
+
+        audit = bridge.recent_action_audit(limit=10)
+        self.assertEqual(audit["schema_version"], 3)
+        self.assertEqual(audit["correlation"]["field"], "operation_id")
+        self.assertFalse(audit["correlation"]["caller_selectable"])
+        self.assertEqual(audit["returned_count"], 0)
+        self.assertEqual(audit["permission_count"], 2)
+        self.assertEqual(audit["permission_returned_count"], 2)
+        newest, older = audit["permission_decisions"]
+        self.assertEqual(newest["entry_type"], "runtime_permission_decision")
+        self.assertEqual(newest["action"], "unit_game")
+        self.assertEqual(newest["outcome"], "denied")
+        self.assertEqual(newest["runtime_profile"], "standard")
+        self.assertEqual(newest["required_tier"], "elevated_input")
+        self.assertFalse(newest["allowed"])
+        self.assertFalse(newest["self_escalation"])
+        self.assertEqual(older["action"], "unit_interact")
+        self.assertEqual(older["outcome"], "allowed")
+        self.assertTrue(older["allowed"])
+
+    def test_nested_action_permission_checks_share_one_operation_id(self):
+        reset_action_audit_for_tests()
+        bridge = FakeCorrelatedUIABridge()
+        first = bridge.click_active_window_uia_element(
+            "Notepad",
+            name="Search",
+            control_type="button",
+        )
+        first_operation_id = first["operation_id"]
+        self.assertTrue(first_operation_id.startswith("op_"))
+        self.assertEqual(first["operation_root_action"], "click_active_window_uia_element")
+
+        audit = bridge.recent_action_audit(limit=10)
+        self.assertEqual(audit["permission_count"], 2)
+        first_decisions = audit["permission_decisions"]
+        self.assertEqual(
+            {entry["action"] for entry in first_decisions},
+            {"click_active_window_uia_element", "click"},
+        )
+        self.assertEqual({entry["operation_id"] for entry in first_decisions}, {first_operation_id})
+        self.assertEqual(
+            {entry["operation_root_action"] for entry in first_decisions},
+            {"click_active_window_uia_element"},
+        )
+
+        second = bridge.click_active_window_uia_element(
+            "Notepad",
+            name="Search",
+            control_type="button",
+        )
+        self.assertNotEqual(second["operation_id"], first_operation_id)
+
+    def test_operation_trace_reconstructs_verified_operation_and_fails_closed_on_partial(self):
+        reset_action_audit_for_tests()
+        bridge = FakeTransactionalBridge(changed=True)
+        result = bridge.click_active_window_uia_element_verified(
+            "Notepad",
+            name="Save",
+            control_type="button",
+            settle_ms=50,
+        )
+        operation_id = result["operation_id"]
+        trace = bridge.operation_trace(operation_id)
+        self.assertEqual(trace["trace_schema_version"], 1)
+        self.assertTrue(trace["found"])
+        self.assertTrue(trace["complete"])
+        self.assertEqual(trace["operation_id"], operation_id)
+        self.assertEqual(trace["operation_root_action"], "click_active_window_uia_element_verified")
+        self.assertEqual(trace["summary"]["permission_decision_count"], 1)
+        self.assertEqual(trace["summary"]["action_result_count"], 1)
+        self.assertEqual(trace["summary"]["final_outcome"], "verified")
+        self.assertTrue(trace["summary"]["verification_passed"])
+        self.assertEqual(
+            [item["kind"] for item in trace["timeline"]],
+            ["permission_decision", "action_result"],
+        )
+        self.assertEqual(
+            [item["event_sequence"] for item in trace["timeline"]],
+            sorted(item["event_sequence"] for item in trace["timeline"]),
+        )
+        self.assertEqual(
+            {entry["operation_id"] for entry in trace["permission_decisions"]},
+            {operation_id},
+        )
+        self.assertEqual(
+            {entry["operation_id"] for entry in trace["action_results"]},
+            {operation_id},
+        )
+        self.assertFalse(trace["caller_selectable_operation_id"])
+
+        audit = bridge.recent_action_audit(limit=5)
+        self.assertEqual(audit["trace_compat"]["schema_version"], 1)
+        self.assertFalse(audit["trace_compat"]["requires_new_input_schema"])
+        self.assertEqual(audit["trace_compat"]["full_trace_tool"], "get_desktop_operation_trace")
+        self.assertEqual(len(audit["recent_operation_traces"]), 1)
+        compat_trace = audit["recent_operation_traces"][0]
+        self.assertEqual(compat_trace["operation_id"], operation_id)
+        self.assertTrue(compat_trace["complete"])
+        self.assertEqual(compat_trace["summary"]["final_outcome"], "verified")
+        self.assertEqual(
+            [item["event_sequence"] for item in compat_trace["timeline"]],
+            sorted(item["event_sequence"] for item in compat_trace["timeline"]),
+        )
+
+        missing = bridge.operation_trace("op_00000000000000000000")
+        self.assertFalse(missing["found"])
+        self.assertFalse(missing["complete"])
+        with self.assertRaisesRegex(DesktopBridgeError, "operation_id must match"):
+            bridge.operation_trace("caller-chosen-id")
+
+    def test_observe_only_profile_blocks_interaction_before_input(self):
+        bridge = FakeGuardedBridge()
+        bridge._runtime_profile_override = "observe_only"
+        with self.assertRaisesRegex(DesktopBridgeError, "does not permit interact"):
+            bridge.press_active_window_key("ENTER", "Notepad")
+        self.assertEqual(bridge.events, [])
+
+    def test_tap_game_key_checks_foreground_and_releases(self):
+        bridge = FakeGameBridge()
+        result = bridge.tap_game_key("W", "ZenlessZoneZero", duration_ms=20)
+        self.assertEqual(result["action"], "tap_game_key")
+        self.assertEqual(result["backend"], "SCAN")
+        self.assertEqual(bridge.events, [(ord("W"), True, "SCAN"), (ord("W"), False, "SCAN")])
+        with self.assertRaises(DesktopBridgeError):
+            bridge.tap_game_key("W", "Notepad", duration_ms=20)
+
+    def test_hold_game_keys_releases_every_key(self):
+        bridge = FakeGameBridge()
+        result = bridge.hold_game_keys(["W", "SHIFT"], "ZenlessZoneZero", duration_ms=20)
+        self.assertEqual(result["keys"], ["W", "SHIFT"])
+        self.assertEqual(result["backend"], "SCAN")
+        self.assertEqual(
+            bridge.events,
+            [
+                (ord("W"), True, "SCAN"),
+                (SAFE_GAME_KEYS["SHIFT"], True, "SCAN"),
+                (SAFE_GAME_KEYS["SHIFT"], False, "SCAN"),
+                (ord("W"), False, "SCAN"),
+            ],
+        )
+
+    def test_existing_press_key_supports_game_compat_syntax(self):
+        bridge = FakeGameBridge()
+        result = bridge.press_key("W+SHIFT:20")
+        self.assertEqual(result["action"], "game_press_key_compat")
+        self.assertEqual(result["keys"], ["W", "SHIFT"])
+        self.assertEqual(result["duration_ms"], 20)
+        self.assertEqual(result["backend"], "SCAN")
+        self.assertEqual(
+            bridge.events,
+            [
+                (ord("W"), True, "SCAN"),
+                (SAFE_GAME_KEYS["SHIFT"], True, "SCAN"),
+                (SAFE_GAME_KEYS["SHIFT"], False, "SCAN"),
+                (ord("W"), False, "SCAN"),
+            ],
+        )
+
+    def test_existing_press_key_accepts_message_backend(self):
+        bridge = FakeGameBridge()
+        result = bridge.press_key("MESSAGE|F2:20")
+        self.assertEqual(result["action"], "game_press_key_compat")
+        self.assertEqual(result["backend"], "MESSAGE")
+        self.assertEqual(result["keys"], ["F2"])
+        self.assertEqual(
+            bridge.events,
+            [(SAFE_GAME_KEYS["F2"], True, "MESSAGE"), (SAFE_GAME_KEYS["F2"], False, "MESSAGE")],
+        )
+
+    def test_existing_press_key_can_select_each_game_backend(self):
+        self.assertEqual(GAME_INPUT_BACKENDS, {"SCAN", "VK", "LEGACY", "MESSAGE"})
+        for backend in sorted(GAME_INPUT_BACKENDS):
+            bridge = FakeGameBridge()
+            result = bridge.press_key(f"{backend}|W:20")
+            self.assertEqual(result["backend"], backend)
+            self.assertEqual(
+                bridge.events,
+                [(ord("W"), True, backend), (ord("W"), False, backend)],
+            )
+
+    def test_message_backend_rejects_persistent_key_down(self):
+        bridge = FakeGameBridge()
+        with self.assertRaises(DesktopBridgeError):
+            bridge.game_key_down("W", "ZenlessZoneZero", backend="MESSAGE")
+
+    def test_real_desktop_screenshot_is_png(self):
+        data = DesktopBridge().screenshot_png()
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_real_active_window_and_window_list_are_readable(self):
+        bridge = DesktopBridge()
+        active = bridge.active_window()
+        self.assertIsInstance(active.hwnd, int)
+        windows = bridge.list_windows(limit=20)
+        self.assertGreaterEqual(len(windows), 1)
+        context = bridge.fast_context(control_limit=20)
+        self.assertEqual(context["active_window"]["hwnd"], active.hwnd)
+        self.assertIn("controls", context)
+        self.assertIn("cursor", context)
+        self.assertIn("virtual_screen", context)
+        self.assertEqual(context["device_snapshot"]["device"]["device_id"], "desktop.windows")
+        self.assertEqual(context["device_snapshot"]["contract"]["version"], "0.1")
+        self.assertEqual(len(context["semantic_signature"]), 24)
+        self.assertNotIn("visual_dhash", context)
+
+        visual_context = bridge.fast_context(control_limit=5, include_visual_hash=True)
+        self.assertEqual(len(visual_context["visual_dhash"]), 16)
+
+    def test_no_destructive_or_shell_tools_exposed(self):
+        tools = asyncio.run(server.list_tools())
+        names = {tool.name.lower() for tool in tools}
+        tools_by_name = {tool.name: tool for tool in tools}
+        click_schema = tools_by_name["click_active_window_uia_element_verified"].input_schema
+        click_properties = click_schema.get("properties", {})
+        for field in (
+            "verification_policy",
+            "execution_mode",
+            "expected_post_element_name",
+            "expected_post_element_control_type",
+            "expected_post_element_automation_id",
+            "expected_post_element_present",
+            "expected_post_window_title_contains",
+        ):
+            self.assertIn(field, click_properties)
+        forbidden = {
+            "shell",
+            "powershell",
+            "cmd",
+            "delete",
+            "remove",
+            "uninstall",
+            "shutdown",
+            "reboot",
+            "registry",
+            "kill",
+            "terminate",
+            "process_kill",
+        }
+        for name in names:
+            self.assertFalse(any(name == word or name.startswith(word + "_") for word in forbidden))
+        self.assertIn("get_desktop_screenshot", names)
+        self.assertIn("get_desktop_active_window", names)
+        self.assertIn("get_desktop_fast_context", names)
+        self.assertIn("get_recent_desktop_action_audit", names)
+        self.assertIn("get_yunkai_watchdog_status", names)
+        self.assertIn("type_secret_alias_into_active_window_uia", names)
+        secret_schema = tools_by_name["type_secret_alias_into_active_window_uia"].input_schema
+        secret_properties = secret_schema.get("properties", {})
+        self.assertIn("alias", secret_properties)
+        self.assertIn("expected_window_title", secret_properties)
+        self.assertNotIn("secret", secret_properties)
+        self.assertNotIn("api_key", secret_properties)
+        self.assertNotIn("token", secret_properties)
+        self.assertIn("get_uia_status", names)
+        self.assertIn("list_active_window_uia_elements", names)
+        self.assertIn("list_active_window_controls", names)
+        self.assertIn("click_desktop", names)
+        self.assertIn("click_active_window_relative", names)
+        self.assertIn("click_active_window_uia_element", names)
+        self.assertIn("type_desktop_text", names)
+        self.assertIn("type_active_window_text", names)
+        self.assertIn("type_active_window_uia_text", names)
+        self.assertIn("press_active_window_key", names)
+        self.assertIn("tap_game_key", names)
+        self.assertIn("hold_game_keys", names)
+        self.assertIn("release_game_keys", names)
+        self.assertIn("tap_game_mouse", names)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
