@@ -1227,5 +1227,1417 @@ class DesktopBridge:
             attempts = attempt
             verification = self.verify_state_change(
                 previous_semantic_signature=before["semantic_signature"],
+                previous_visual_dhash=before.get("visual_dhash"),
+                previous_window_hwnd=before["active_window"]["hwnd"],
+                previous_window_title=before["active_window"]["title"],
+                control_limit=control_limit,
+            )
+            policy_result = self.evaluate_verification_policy(verification, verification_policy)
+            postconditions = self.evaluate_expected_postconditions(
+                expected_element_name=expected_element_name,
+                expected_element_control_type=expected_element_control_type,
+                expected_element_automation_id=expected_element_automation_id,
+                expected_element_present=expected_element_present,
+                expected_window_title_contains=expected_window_title_contains,
+            )
+            contract_result = combine_verification_result(policy_result, postconditions)
+            if bool(contract_result.get("verification_passed")):
+                break
+            if not bool(postconditions.get("configured")):
+                break
+            if attempt >= POST_ACTION_OBSERVATION_MAX_ATTEMPTS:
+                break
+            time.sleep(POST_ACTION_OBSERVATION_INTERVAL_SECONDS)
+            waited_ms += int(round(POST_ACTION_OBSERVATION_INTERVAL_SECONDS * 1000))
 
-[Showing lines 1-1229 of 2644 (50.0KB limit). Use offset=1230 to continue.]
+        observation = {
+            "attempts": attempts,
+            "waited_ms": waited_ms,
+            "stabilized_after_initial_read": bool(attempts > 1 and contract_result.get("verification_passed")),
+            "action_retry_performed": False,
+        }
+        contract_result = {**contract_result, "observation": observation}
+        postconditions = {**postconditions, "observation": observation}
+        return verification, policy_result, postconditions, contract_result
+
+    @staticmethod
+    def _audit_state_from_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not context:
+            return None
+        active = dict(context.get("active_window") or {})
+        return {
+            "semantic_signature": context.get("semantic_signature"),
+            "visual_dhash": context.get("visual_dhash"),
+            "window_hwnd": active.get("hwnd"),
+            "window_title": str(active.get("title", ""))[:300] or None,
+            "semantic_source": context.get("semantic_source"),
+        }
+
+    @staticmethod
+    def _audit_state_from_verification(verification: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not verification:
+            return None
+        current = dict(verification.get("current") or {})
+        if not current:
+            return None
+        return {
+            "semantic_signature": current.get("semantic_signature"),
+            "visual_dhash": current.get("visual_dhash"),
+            "window_hwnd": current.get("window_hwnd"),
+            "window_title": str(current.get("window_title", ""))[:300] or None,
+            "semantic_source": current.get("semantic_source"),
+        }
+
+    @staticmethod
+    def _audit_selector(
+        *,
+        name: str | None,
+        control_type: str | None,
+        automation_id: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "name": str(name or "")[:300] or None,
+            "control_type": str(control_type or "")[:100] or None,
+            "automation_id": str(automation_id or "")[:300] or None,
+        }
+
+    @staticmethod
+    def recent_action_audit(
+        limit: int = 20,
+        action: str | None = None,
+        outcome: str | None = None,
+    ) -> dict[str, Any]:
+        return recent_action_audit(limit=limit, action=action, outcome=outcome)
+
+    @staticmethod
+    def operation_trace(operation_id: str) -> dict[str, Any]:
+        try:
+            return operation_trace(operation_id)
+        except ValueError as exc:
+            raise DesktopBridgeError(str(exc)) from exc
+
+    @_operation_scoped
+    def focus_window(self, hwnd: int) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="focus_window")
+        hwnd = int(hwnd)
+        window = self._window_from_hwnd(hwnd)
+        if not window.visible:
+            raise DesktopBridgeError("The requested window is not visible.")
+        if window.minimized:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.1)
+
+        # SetForegroundWindow is intentionally restricted by Windows. Attach the
+        # caller's input queue to the current foreground/target threads briefly,
+        # then request foreground focus using documented Win32 APIs.
+        user32 = ctypes.windll.user32
+        foreground = win32gui.GetForegroundWindow()
+        current_thread = win32api.GetCurrentThreadId()
+        target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
+        foreground_thread = 0
+        if foreground:
+            foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
+
+        attached: list[int] = []
+        try:
+            for thread_id in (foreground_thread, target_thread):
+                if thread_id and thread_id != current_thread:
+                    if user32.AttachThreadInput(current_thread, int(thread_id), True):
+                        attached.append(int(thread_id))
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.05)
+        except Exception as exc:
+            raise DesktopBridgeError(f"Windows refused to focus the window: {exc}") from exc
+        finally:
+            for thread_id in reversed(attached):
+                user32.AttachThreadInput(current_thread, thread_id, False)
+
+        focused = self.active_window()
+        if focused.hwnd != hwnd:
+            raise DesktopBridgeError(
+                f"Focus request did not take effect; foreground remains '{focused.title}'."
+            )
+        return {"status": "ok", "action": "focus_window", "window": focused.as_dict()}
+
+    def _validate_point(self, x: int, y: int) -> tuple[int, int]:
+        x, y = int(x), int(y)
+        left, top, width, height = self.virtual_screen()
+        if not (left <= x < left + width and top <= y < top + height):
+            raise DesktopBridgeError(
+                f"Point ({x}, {y}) is outside virtual desktop [{left},{top},{left + width},{top + height}]."
+            )
+        return x, y
+
+    def _require_active_title(self, expected_window_title: str) -> DesktopWindow:
+        expected = expected_window_title.strip()
+        if not expected or len(expected) > 200:
+            raise DesktopBridgeError("expected_window_title must be 1-200 characters.")
+        window = self.active_window()
+        if expected.casefold() not in window.title.casefold():
+            raise DesktopBridgeError(
+                f"Guarded desktop input refused because foreground window '{window.title}' "
+                f"does not match expected title '{expected}'."
+            )
+        return window
+
+    def active_window_point(
+        self,
+        x_ratio: float,
+        y_ratio: float,
+        expected_window_title: str,
+    ) -> tuple[DesktopWindow, int, int]:
+        window = self._require_active_title(expected_window_title)
+        try:
+            x_ratio = float(x_ratio)
+            y_ratio = float(y_ratio)
+        except (TypeError, ValueError) as exc:
+            raise DesktopBridgeError("Relative coordinates must be numeric values from 0.0 to 1.0.") from exc
+        if not (0.0 <= x_ratio <= 1.0 and 0.0 <= y_ratio <= 1.0):
+            raise DesktopBridgeError("Relative coordinates must be between 0.0 and 1.0 inclusive.")
+        left, top, right, bottom = self.clamp_region_to_virtual_screen(*window.rect)
+        x = left + round(x_ratio * max(0, right - left - 1))
+        y = top + round(y_ratio * max(0, bottom - top - 1))
+        return window, x, y
+
+    @_operation_scoped
+    def click_active_window_relative(
+        self,
+        x_ratio: float,
+        y_ratio: float,
+        expected_window_title: str,
+        button: str = "left",
+        clicks: int = 1,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="click_active_window_relative")
+        window, x, y = self.active_window_point(x_ratio, y_ratio, expected_window_title)
+        result = self.click(x, y, button=button, clicks=clicks)
+        return {
+            **result,
+            "action": "click_active_window_relative",
+            "window": window.title,
+            "x_ratio": float(x_ratio),
+            "y_ratio": float(y_ratio),
+        }
+
+    @_operation_scoped
+    def type_active_window_text(self, text: str, expected_window_title: str) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="type_active_window_text")
+        window = self._require_active_title(expected_window_title)
+        def confirm_window() -> None:
+            current = self._require_active_title(expected_window_title)
+            if current.hwnd != window.hwnd:
+                raise DesktopBridgeError("Desktop text input stopped: foreground window changed; insertion may be partial and was not retried.")
+
+        result = self.type_text(text, _before_chunk=confirm_window)
+        return {**result, "action": "type_active_window_text", "window": window.title}
+
+    @_operation_scoped
+    def press_active_window_key(self, key: str, expected_window_title: str) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="press_active_window_key")
+        window = self._require_active_title(expected_window_title)
+        normalized = key.strip().upper()
+        if normalized not in SAFE_KEYS:
+            raise DesktopBridgeError("Unsupported guarded desktop key. Allowed: " + ", ".join(sorted(SAFE_KEYS)))
+        vk = SAFE_KEYS[normalized]
+        self._send_vk(vk, True)
+        self._send_vk(vk, False)
+        return {
+            "status": "ok",
+            "action": "press_active_window_key",
+            "key": normalized,
+            "window": window.title,
+        }
+
+    def _select_active_uia_element(
+        self,
+        expected_window_title: str,
+        *,
+        name: str | None = None,
+        control_type: str | None = None,
+        automation_id: str | None = None,
+        allow_password: bool = False,
+    ) -> tuple[DesktopWindow, dict[str, Any]]:
+        window = self._require_active_title(expected_window_title)
+        name_value = (name or "").strip()
+        automation_value = (automation_id or "").strip()
+        type_value = (control_type or "").strip().casefold()
+        if not name_value and not automation_value:
+            raise DesktopBridgeError("UIA selector requires name and/or automation_id.")
+        if len(name_value) > 500 or len(automation_value) > 500 or len(type_value) > 100:
+            raise DesktopBridgeError("UIA selector is too long.")
+
+        elements, _truncated = self.list_uia_elements(
+            hwnd=window.hwnd,
+            limit=400,
+            max_depth=20,
+        )
+        matches: list[dict[str, Any]] = []
+        for element in elements:
+            if name_value and str(element.get("name", "")).casefold() != name_value.casefold():
+                continue
+            if automation_value and str(element.get("automation_id", "")).casefold() != automation_value.casefold():
+                continue
+            if type_value and str(element.get("control_type", "")).casefold() != type_value:
+                continue
+            matches.append(element)
+
+        if not matches:
+            raise DesktopBridgeError("No UI Automation element matched the exact selector in the active window.")
+        if len(matches) > 1:
+            raise DesktopBridgeError(
+                f"UI Automation selector is ambiguous: {len(matches)} elements matched. "
+                "Add control_type or automation_id to disambiguate."
+            )
+        element = matches[0]
+        if not element.get("actionable"):
+            raise DesktopBridgeError("Matched UI Automation element is not currently actionable.")
+        if element.get("is_password") and not allow_password:
+            raise DesktopBridgeError("Password UI Automation elements are not exposed for semantic actions.")
+        return window, element
+
+    def _uia_element_click_point(
+        self,
+        window: DesktopWindow,
+        element: dict[str, Any],
+    ) -> tuple[int, int]:
+        rect = list(element.get("rect") or [0, 0, 0, 0])
+        if len(rect) != 4:
+            raise DesktopBridgeError("Matched UI Automation element has no valid rectangle.")
+        window_left, window_top, window_right, window_bottom = self.clamp_region_to_virtual_screen(*window.rect)
+        left = max(int(rect[0]), window_left)
+        top = max(int(rect[1]), window_top)
+        right = min(int(rect[2]), window_right)
+        bottom = min(int(rect[3]), window_bottom)
+        if right <= left or bottom <= top:
+            raise DesktopBridgeError("Matched UI Automation element is outside the visible active window.")
+        return self._validate_point((left + right) // 2, (top + bottom) // 2)
+
+    @_operation_scoped
+    def click_active_window_uia_element(
+        self,
+        expected_window_title: str,
+        *,
+        name: str | None = None,
+        control_type: str | None = None,
+        automation_id: str | None = None,
+        button: str = "left",
+        clicks: int = 1,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="click_active_window_uia_element")
+        window, element = self._select_active_uia_element(
+            expected_window_title,
+            name=name,
+            control_type=control_type,
+            automation_id=automation_id,
+        )
+        blocked_names = {"close", "minimize", "restore", "maximize"}
+        if str(element.get("name", "")).strip().casefold() in blocked_names:
+            raise DesktopBridgeError("Window-level Close/Minimize/Restore/Maximize controls are not exposed through UIA actions.")
+        x, y = self._uia_element_click_point(window, element)
+        self._require_active_title(expected_window_title)
+        # Chromium/Electron can briefly keep its accessibility/UI thread busy
+        # immediately after a UIA tree scan. A short bounded settle interval
+        # avoids dropping the one intended mouse input without retrying it.
+        time.sleep(UIA_ACTION_PRE_INPUT_DELAY_SECONDS)
+        self._require_active_title(expected_window_title)
+        result = self.click(x, y, button=button, clicks=clicks)
+        return {
+            **result,
+            "action": "click_active_window_uia_element",
+            "window": window.title,
+            "matched_element": self._compact_uia_elements([element], 1)[0],
+        }
+
+    @_operation_scoped
+    def type_active_window_uia_text(
+        self,
+        text: str,
+        expected_window_title: str,
+        *,
+        name: str | None = None,
+        automation_id: str | None = None,
+        replace_existing: bool = False,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="type_active_window_uia_text")
+        try:
+            plan_text_chunks(text)  # Reject before click or optional Ctrl+A can change the target.
+        except ValueError as exc:
+            raise DesktopBridgeError(str(exc)) from exc
+        window, element = self._select_active_uia_element(
+            expected_window_title,
+            name=name,
+            control_type="edit",
+            automation_id=automation_id,
+        )
+        if str(element.get("control_type", "")).casefold() != "edit":
+            raise DesktopBridgeError("Semantic text input is limited to UI Automation edit controls.")
+        x, y = self._uia_element_click_point(window, element)
+        self._require_active_title(expected_window_title)
+        time.sleep(UIA_ACTION_PRE_INPUT_DELAY_SECONDS)
+        self._require_active_title(expected_window_title)
+        self.click(x, y, button="left", clicks=1)
+        self._require_active_title(expected_window_title)
+        # Never send Ctrl+A/text until UIA confirms that the exact edit control
+        # actually received keyboard focus. This turns a dropped Chromium click
+        # into a safe refusal instead of typing into an unintended surface.
+        time.sleep(UIA_ACTION_PRE_INPUT_DELAY_SECONDS)
+        _focused_window, focused_element = self._select_active_uia_element(
+            expected_window_title,
+            name=name,
+            control_type="edit",
+            automation_id=automation_id,
+        )
+        if focused_element.get("has_keyboard_focus") is not True:
+            raise DesktopBridgeError(
+                "Semantic text input refused because the matched UIA edit control did not receive keyboard focus."
+            )
+        if replace_existing:
+            self.hotkey("CTRL+A")
+        def confirm_target() -> None:
+            current_window, current = self._select_active_uia_element(
+                expected_window_title,
+                name=name,
+                control_type="edit",
+                automation_id=automation_id,
+            )
+            if current_window.hwnd != window.hwnd or current.get("has_keyboard_focus") is not True:
+                raise DesktopBridgeError("Semantic text input stopped: target edit control lost keyboard focus; insertion may be partial and was not retried.")
+
+        typed = self.type_text(text, _before_chunk=confirm_target)
+        return {
+            **typed,
+            "action": "type_active_window_uia_text",
+            "window": window.title,
+            "replace_existing": bool(replace_existing),
+            "matched_element": self._compact_uia_elements([focused_element], 1)[0],
+            "keyboard_focus_verified": True,
+        }
+
+    @_operation_scoped
+    def type_secret_into_active_window_uia(
+        self,
+        secret: str,
+        secret_alias: str,
+        expected_window_title: str,
+        *,
+        name: str | None = None,
+        automation_id: str | None = None,
+        replace_existing: bool = True,
+    ) -> dict[str, Any]:
+        """Type a locally resolved secret into one exact edit control without exposing the secret in results/audit."""
+        permission_decision: dict[str, Any] | None = None
+        selector = self._audit_selector(name=name, control_type="edit", automation_id=automation_id)
+        try:
+            permission_decision = self._require_permission_tier(
+                "interact",
+                action="type_secret_alias_into_active_window_uia",
+            )
+            if not isinstance(secret, str) or not secret or len(secret) > 8192:
+                raise DesktopBridgeError("Resolved secret is empty or exceeds the secure input limit.")
+            if any(char in secret for char in ("\x00", "\r", "\n")):
+                raise DesktopBridgeError("Resolved secret is not a supported single-line value.")
+            window, element = self._select_active_uia_element(
+                expected_window_title,
+                name=name,
+                control_type="edit",
+                automation_id=automation_id,
+                allow_password=True,
+            )
+            x, y = self._uia_element_click_point(window, element)
+            self._require_active_title(expected_window_title)
+            time.sleep(UIA_ACTION_PRE_INPUT_DELAY_SECONDS)
+            self._require_active_title(expected_window_title)
+            self.click(x, y, button="left", clicks=1)
+            self._require_active_title(expected_window_title)
+            time.sleep(UIA_ACTION_PRE_INPUT_DELAY_SECONDS)
+            _focused_window, focused_element = self._select_active_uia_element(
+                expected_window_title,
+                name=name,
+                control_type="edit",
+                automation_id=automation_id,
+                allow_password=True,
+            )
+            if focused_element.get("has_keyboard_focus") is not True:
+                raise DesktopBridgeError(
+                    "Secure secret input refused because the matched edit control did not receive keyboard focus."
+                )
+            if replace_existing:
+                self.hotkey("CTRL+A")
+            def confirm_secret_target() -> None:
+                current_window, current = self._select_active_uia_element(
+                    expected_window_title,
+                    name=name,
+                    control_type="edit",
+                    automation_id=automation_id,
+                    allow_password=True,
+                )
+                if current_window.hwnd != window.hwnd or current.get("has_keyboard_focus") is not True:
+                    raise DesktopBridgeError("Secure input stopped: target edit control lost keyboard focus; insertion may be partial and was not retried.")
+
+            typed = self.type_text(secret, _before_chunk=confirm_secret_target)
+            audit = append_action_audit(
+                {
+                    **self._operation_metadata("type_secret_alias_into_active_window_uia"),
+                    "action": "type_secret_alias_into_active_window_uia",
+                    "outcome": "secure_input_sent",
+                    "runtime_permission": permission_decision,
+                    "target": selector,
+                    "secret_metadata": {
+                        "alias": str(secret_alias)[:64],
+                        "value_exposed": False,
+                        "value_logged": False,
+                        "password_field": bool(focused_element.get("is_password")),
+                        "replace_existing": bool(replace_existing),
+                        "keyboard_focus_verified": True,
+                    },
+                    "retry_performed": False,
+                }
+            )
+            return {
+                "status": "ok",
+                "action": "type_secret_alias_into_active_window_uia",
+                "window": window.title,
+                "secret_alias": str(secret_alias)[:64],
+                "secret_value_exposed": False,
+                "characters_sent": int(typed.get("characters", 0)),
+                "replace_existing": bool(replace_existing),
+                "matched_element": self._compact_uia_elements([focused_element], 1)[0],
+                "keyboard_focus_verified": True,
+                "runtime_permission": permission_decision,
+                "audit": audit,
+                "retry_performed": False,
+            }
+        except Exception as exc:
+            append_action_audit(
+                {
+                    **self._operation_metadata("type_secret_alias_into_active_window_uia"),
+                    "action": "type_secret_alias_into_active_window_uia",
+                    "outcome": "refused" if isinstance(exc, DesktopBridgeError) else "error",
+                    "runtime_permission": permission_decision,
+                    "target": selector,
+                    "secret_metadata": {
+                        "alias": str(secret_alias)[:64],
+                        "value_exposed": False,
+                        "value_logged": False,
+                        "replace_existing": bool(replace_existing),
+                    },
+                    "error": {"type": type(exc).__name__, "message": str(exc)[:500]},
+                    "retry_performed": False,
+                }
+            )
+            raise
+
+    @staticmethod
+    def _bounded_settle_ms(value: int) -> int:
+        settle_ms = int(value)
+        if settle_ms < 50 or settle_ms > 2000:
+            raise DesktopBridgeError("settle_ms must be between 50 and 2000 milliseconds.")
+        return settle_ms
+
+    @_operation_scoped
+    def click_active_window_uia_element_verified(
+        self,
+        expected_window_title: str,
+        *,
+        name: str | None = None,
+        control_type: str | None = None,
+        automation_id: str | None = None,
+        button: str = "left",
+        clicks: int = 1,
+        settle_ms: int = 250,
+        control_limit: int = 80,
+        verification_policy: str = "any_confident_change",
+        execution_mode: str = "safe",
+        expected_post_element_name: str | None = None,
+        expected_post_element_control_type: str | None = None,
+        expected_post_element_automation_id: str | None = None,
+        expected_post_element_present: bool | None = None,
+        expected_post_window_title_contains: str | None = None,
+    ) -> dict[str, Any]:
+        requested_settle_ms = self._bounded_settle_ms(settle_ms)
+        policy = self._normalize_verification_policy(verification_policy)
+        requested_execution_mode = self._normalize_execution_mode(execution_mode)
+        effective_settle_ms = requested_settle_ms
+        verification_control_limit = int(control_limit)
+        execution_mode_used = "safe"
+        fast_path_fallback_reason: str | None = None
+        before: dict[str, Any] | None = None
+        selector = self._audit_selector(
+            name=name,
+            control_type=control_type,
+            automation_id=automation_id,
+        )
+        permission_decision: dict[str, Any] | None = None
+        try:
+            permission_decision = self._require_permission_tier(
+                "interact",
+                action="click_active_window_uia_element_verified",
+            )
+            self._normalize_expected_post_request(
+                expected_element_name=expected_post_element_name,
+                expected_element_control_type=expected_post_element_control_type,
+                expected_element_automation_id=expected_post_element_automation_id,
+                expected_element_present=expected_post_element_present,
+                expected_window_title_contains=expected_post_window_title_contains,
+            )
+            if requested_execution_mode == "fast":
+                fast_path_fallback_reason = self._fast_path_preflight_reason(
+                    name=name,
+                    control_type=control_type,
+                    automation_id=automation_id,
+                    button=button,
+                    clicks=clicks,
+                    verification_policy=policy,
+                )
+                if fast_path_fallback_reason is None:
+                    fast_control_limit = max(int(control_limit), FAST_PATH_MIN_CONTEXT_LIMIT)
+                    before = self.fast_context(
+                        control_limit=fast_control_limit,
+                        include_visual_hash=False,
+                    )
+                    fast_element, fast_path_fallback_reason = self._select_fast_context_uia_element(
+                        before,
+                        name=name,
+                        control_type=control_type,
+                        automation_id=automation_id,
+                    )
+                    if fast_path_fallback_reason is None and fast_element is not None:
+                        observed_hwnd = int(dict(before.get("active_window") or {}).get("hwnd") or 0)
+                        current_window = self._require_active_title(expected_window_title)
+                        if not observed_hwnd or int(current_window.hwnd) != observed_hwnd:
+                            fast_path_fallback_reason = "foreground_window_changed_after_fast_context"
+                        else:
+                            execution_mode_used = "fast"
+                            effective_settle_ms = min(requested_settle_ms, FAST_PATH_SETTLE_MAX_MS)
+                            verification_control_limit = fast_control_limit
+                            action_result = self._click_fast_context_uia_element(
+                                expected_window_title,
+                                context=before,
+                                element=fast_element,
+                            )
+
+            if execution_mode_used == "safe":
+                before = self.fast_context(control_limit=control_limit, include_visual_hash=True)
+                action_result = self.click_active_window_uia_element(
+                    expected_window_title,
+                    name=name,
+                    control_type=control_type,
+                    automation_id=automation_id,
+                    button=button,
+                    clicks=clicks,
+                )
+
+            time.sleep(effective_settle_ms / 1000.0)
+            verification, policy_result, postconditions, contract_result = self._observe_verification_contract(
+                before=before,
+                verification_policy=policy,
+                control_limit=verification_control_limit,
+                expected_element_name=expected_post_element_name,
+                expected_element_control_type=expected_post_element_control_type,
+                expected_element_automation_id=expected_post_element_automation_id,
+                expected_element_present=expected_post_element_present,
+                expected_window_title_contains=expected_post_window_title_contains,
+            )
+            verification = {
+                **verification,
+                **self._operation_metadata("click_active_window_uia_element_verified"),
+            }
+            final_passed = bool(contract_result["verification_passed"])
+            audit = append_action_audit(
+                {
+                    **self._operation_metadata("click_active_window_uia_element_verified"),
+                    "action": "click_active_window_uia_element_verified",
+                    "outcome": "verified" if final_passed else "verification_failed",
+                    "verification_policy": policy,
+                    "runtime_permission": permission_decision,
+                    "policy_passed": bool(policy_result["policy_passed"]),
+                    "postconditions": postconditions,
+                    "verification_passed": final_passed,
+                    "verification_contract": contract_result,
+                    "target": selector,
+                    "input_metadata": {
+                        "button": str(button)[:20],
+                        "clicks": int(clicks),
+                        "settle_ms_requested": requested_settle_ms,
+                        "settle_ms_effective": effective_settle_ms,
+                        "execution_mode_requested": requested_execution_mode,
+                        "execution_mode_used": execution_mode_used,
+                        "fast_path_fallback_reason": fast_path_fallback_reason,
+                    },
+                    "pre_state": self._audit_state_from_context(before),
+                    "post_state": self._audit_state_from_verification(verification),
+                    "verification": {
+                        "state_change_detected": bool(verification.get("state_change_detected")),
+                        "semantic_changed": bool(verification.get("semantic_changed")),
+                        "window_identity_changed": bool(verification.get("window_identity_changed")),
+                        "visual_change_confident": bool(verification.get("visual_change_confident")),
+                        "visual_hamming_distance": verification.get("visual_hamming_distance"),
+                    },
+                    "retry_performed": False,
+                }
+            )
+            return {
+                "status": "ok",
+                "action": "click_active_window_uia_element_verified",
+                "settle_ms": effective_settle_ms,
+                "settle_ms_requested": requested_settle_ms,
+                "execution_mode_requested": requested_execution_mode,
+                "execution_mode_used": execution_mode_used,
+                "fast_path_fallback_reason": fast_path_fallback_reason,
+                "retry_performed": False,
+                "action_result": action_result,
+                "verification_policy": policy,
+                "runtime_permission": permission_decision,
+                "verification_passed": final_passed,
+                "policy": policy_result,
+                "postconditions": postconditions,
+                "verification_contract": contract_result,
+                "verification": verification,
+                "audit": audit,
+            }
+        except Exception as exc:
+            append_action_audit(
+                {
+                    **self._operation_metadata("click_active_window_uia_element_verified"),
+                    "action": "click_active_window_uia_element_verified",
+                    "outcome": "refused" if isinstance(exc, DesktopBridgeError) else "error",
+                    "verification_policy": policy,
+                    "runtime_permission": permission_decision,
+                    "policy_passed": False,
+                    "target": selector,
+                    "expected_post": {
+                        "element": self._audit_selector(
+                            name=expected_post_element_name,
+                            control_type=expected_post_element_control_type,
+                            automation_id=expected_post_element_automation_id,
+                        ),
+                        "element_present": expected_post_element_present,
+                        "window_title_contains": str(expected_post_window_title_contains or "")[:200] or None,
+                    },
+                    "input_metadata": {
+                        "button": str(button)[:20],
+                        "clicks": int(clicks),
+                        "settle_ms_requested": requested_settle_ms,
+                        "settle_ms_effective": effective_settle_ms,
+                        "execution_mode_requested": requested_execution_mode,
+                        "execution_mode_used": execution_mode_used,
+                        "fast_path_fallback_reason": fast_path_fallback_reason,
+                    },
+                    "pre_state": self._audit_state_from_context(before),
+                    "post_state": None,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                    },
+                    "retry_performed": False,
+                }
+            )
+            raise
+
+    @_operation_scoped
+    def type_active_window_uia_text_verified(
+        self,
+        text: str,
+        expected_window_title: str,
+        *,
+        name: str | None = None,
+        automation_id: str | None = None,
+        replace_existing: bool = False,
+        settle_ms: int = 250,
+        control_limit: int = 80,
+        verification_policy: str = "any_confident_change",
+        expected_post_element_name: str | None = None,
+        expected_post_element_control_type: str | None = None,
+        expected_post_element_automation_id: str | None = None,
+        expected_post_element_present: bool | None = None,
+        expected_post_window_title_contains: str | None = None,
+    ) -> dict[str, Any]:
+        settle_ms = self._bounded_settle_ms(settle_ms)
+        policy = self._normalize_verification_policy(verification_policy)
+        before: dict[str, Any] | None = None
+        selector = self._audit_selector(
+            name=name,
+            control_type="edit",
+            automation_id=automation_id,
+        )
+        permission_decision: dict[str, Any] | None = None
+        try:
+            permission_decision = self._require_permission_tier(
+                "interact",
+                action="type_active_window_uia_text_verified",
+            )
+            try:
+                plan_text_chunks(text)
+            except ValueError as exc:
+                raise DesktopBridgeError(str(exc)) from exc
+            self._normalize_expected_post_request(
+                expected_element_name=expected_post_element_name,
+                expected_element_control_type=expected_post_element_control_type,
+                expected_element_automation_id=expected_post_element_automation_id,
+                expected_element_present=expected_post_element_present,
+                expected_window_title_contains=expected_post_window_title_contains,
+            )
+            before = self.fast_context(control_limit=control_limit, include_visual_hash=True)
+            action_result = self.type_active_window_uia_text(
+                text,
+                expected_window_title,
+                name=name,
+                automation_id=automation_id,
+                replace_existing=replace_existing,
+            )
+            time.sleep(settle_ms / 1000.0)
+            verification, policy_result, postconditions, contract_result = self._observe_verification_contract(
+                before=before,
+                verification_policy=policy,
+                control_limit=control_limit,
+                expected_element_name=expected_post_element_name,
+                expected_element_control_type=expected_post_element_control_type,
+                expected_element_automation_id=expected_post_element_automation_id,
+                expected_element_present=expected_post_element_present,
+                expected_window_title_contains=expected_post_window_title_contains,
+            )
+            verification = {
+                **verification,
+                **self._operation_metadata("type_active_window_uia_text_verified"),
+            }
+            final_passed = bool(contract_result["verification_passed"])
+            audit = append_action_audit(
+                {
+                    **self._operation_metadata("type_active_window_uia_text_verified"),
+                    "action": "type_active_window_uia_text_verified",
+                    "outcome": "verified" if final_passed else "verification_failed",
+                    "verification_policy": policy,
+                    "runtime_permission": permission_decision,
+                    "policy_passed": bool(policy_result["policy_passed"]),
+                    "postconditions": postconditions,
+                    "verification_passed": final_passed,
+                    "verification_contract": contract_result,
+                    "target": selector,
+                    "input_metadata": {
+                        "text_length": len(text),
+                        "chunk_count": action_result.get("chunk_count"),
+                        "chunk_size_policy": action_result.get("chunk_size_policy"),
+                        "replace_existing": bool(replace_existing),
+                        "settle_ms": settle_ms,
+                        "keyboard_focus_verified": bool(action_result.get("keyboard_focus_verified")),
+                    },
+                    "pre_state": self._audit_state_from_context(before),
+                    "post_state": self._audit_state_from_verification(verification),
+                    "verification": {
+                        "state_change_detected": bool(verification.get("state_change_detected")),
+                        "semantic_changed": bool(verification.get("semantic_changed")),
+                        "window_identity_changed": bool(verification.get("window_identity_changed")),
+                        "visual_change_confident": bool(verification.get("visual_change_confident")),
+                        "visual_hamming_distance": verification.get("visual_hamming_distance"),
+                    },
+                    "retry_performed": False,
+                }
+            )
+            return {
+                "status": "ok",
+                "action": "type_active_window_uia_text_verified",
+                "settle_ms": settle_ms,
+                "retry_performed": False,
+                "action_result": action_result,
+                "verification_policy": policy,
+                "runtime_permission": permission_decision,
+                "verification_passed": final_passed,
+                "policy": policy_result,
+                "postconditions": postconditions,
+                "verification_contract": contract_result,
+                "verification": verification,
+                "audit": audit,
+            }
+        except Exception as exc:
+            append_action_audit(
+                {
+                    **self._operation_metadata("type_active_window_uia_text_verified"),
+                    "action": "type_active_window_uia_text_verified",
+                    "outcome": "refused" if isinstance(exc, DesktopBridgeError) else "error",
+                    "verification_policy": policy,
+                    "runtime_permission": permission_decision,
+                    "policy_passed": False,
+                    "target": selector,
+                    "expected_post": {
+                        "element": self._audit_selector(
+                            name=expected_post_element_name,
+                            control_type=expected_post_element_control_type,
+                            automation_id=expected_post_element_automation_id,
+                        ),
+                        "element_present": expected_post_element_present,
+                        "window_title_contains": str(expected_post_window_title_contains or "")[:200] or None,
+                    },
+                    "input_metadata": {
+                        "text_length": len(text),
+                        "replace_existing": bool(replace_existing),
+                        "settle_ms": settle_ms,
+                    },
+                    "pre_state": self._audit_state_from_context(before),
+                    "post_state": None,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc)[:500],
+                    },
+                    "retry_performed": False,
+                }
+            )
+            raise
+
+    @_operation_scoped
+    def move_mouse(self, x: int, y: int) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="move_mouse")
+        x, y = self._validate_point(x, y)
+        win32api.SetCursorPos((x, y))
+        return {"status": "ok", "action": "move_mouse", "x": x, "y": y}
+
+    @_operation_scoped
+    def click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="click")
+        x, y = self._validate_point(x, y)
+        button = button.strip().lower()
+        if button not in {"left", "right"}:
+            raise DesktopBridgeError("Mouse button must be 'left' or 'right'.")
+        clicks = max(1, min(2, int(clicks)))
+        down_flag, up_flag = (
+            (win32con.MOUSEEVENTF_LEFTDOWN, win32con.MOUSEEVENTF_LEFTUP)
+            if button == "left"
+            else (win32con.MOUSEEVENTF_RIGHTDOWN, win32con.MOUSEEVENTF_RIGHTUP)
+        )
+
+        # Borderless/exclusive games can reject SetCursorPos even though injected
+        # mouse input is accepted. Use an absolute injected move for ZZZ while
+        # preserving the ordinary desktop path everywhere else.
+        active_title = self.active_window().title
+        if "zenlesszonezero" in active_title.casefold():
+            left, top, width, height = self.virtual_screen()
+            norm_x = round((x - left) * 65535 / max(1, width - 1))
+            norm_y = round((y - top) * 65535 / max(1, height - 1))
+            virtual_desk_flag = getattr(win32con, "MOUSEEVENTF_VIRTUALDESK", 0x4000)
+            win32api.mouse_event(
+                win32con.MOUSEEVENTF_MOVE | win32con.MOUSEEVENTF_ABSOLUTE | virtual_desk_flag,
+                norm_x,
+                norm_y,
+                0,
+                0,
+            )
+            move_mode = "injected_absolute"
+        else:
+            win32api.SetCursorPos((x, y))
+            move_mode = "set_cursor_pos"
+
+        for _ in range(clicks):
+            win32api.mouse_event(down_flag, 0, 0, 0, 0)
+            win32api.mouse_event(up_flag, 0, 0, 0, 0)
+            if clicks > 1:
+                time.sleep(0.08)
+        return {
+            "status": "ok",
+            "action": "click",
+            "x": x,
+            "y": y,
+            "button": button,
+            "clicks": clicks,
+            "move_mode": move_mode,
+        }
+
+    @_operation_scoped
+    def drag(self, start_x: int, start_y: int, end_x: int, end_y: int, duration_ms: int = 500) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="drag")
+        start_x, start_y = self._validate_point(start_x, start_y)
+        end_x, end_y = self._validate_point(end_x, end_y)
+        duration_ms = max(100, min(5000, int(duration_ms)))
+        win32api.SetCursorPos((start_x, start_y))
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        steps = max(2, min(120, duration_ms // 16))
+        for i in range(1, steps + 1):
+            ratio = i / steps
+            x = round(start_x + (end_x - start_x) * ratio)
+            y = round(start_y + (end_y - start_y) * ratio)
+            win32api.SetCursorPos((x, y))
+            time.sleep(duration_ms / steps / 1000.0)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return {
+            "status": "ok",
+            "action": "drag",
+            "start": [start_x, start_y],
+            "end": [end_x, end_y],
+            "duration_ms": duration_ms,
+        }
+
+    @_operation_scoped
+    def scroll(self, delta: int, x: int | None = None, y: int | None = None) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="scroll")
+        delta = max(-20, min(20, int(delta)))
+        if delta == 0:
+            raise DesktopBridgeError("Scroll delta must not be zero.")
+        if x is not None or y is not None:
+            if x is None or y is None:
+                raise DesktopBridgeError("Provide both x and y, or neither, for scrolling.")
+            x, y = self._validate_point(x, y)
+            win32api.SetCursorPos((x, y))
+        win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, delta * win32con.WHEEL_DELTA, 0)
+        cursor = win32api.GetCursorPos()
+        return {"status": "ok", "action": "scroll", "delta": delta, "cursor": [cursor[0], cursor[1]]}
+
+    @staticmethod
+    def _send_vk(vk: int, down: bool) -> None:
+        flags = 0 if down else win32con.KEYEVENTF_KEYUP
+        win32api.keybd_event(vk, 0, flags, 0)
+
+    @staticmethod
+    def _normalize_game_backend(backend: str | None) -> str:
+        normalized = (backend or DEFAULT_GAME_INPUT_BACKEND).strip().upper()
+        if normalized not in GAME_INPUT_BACKENDS:
+            raise DesktopBridgeError(
+                "Unsupported Game Mode input backend. Allowed: " + ", ".join(sorted(GAME_INPUT_BACKENDS))
+            )
+        return normalized
+
+    @staticmethod
+    def _send_game_vk(
+        vk: int,
+        down: bool,
+        backend: str = DEFAULT_GAME_INPUT_BACKEND,
+        hwnd: int | None = None,
+    ) -> None:
+        """Send one allowlisted game key through a selected documented Windows input API."""
+        backend = DesktopBridge._normalize_game_backend(backend)
+        if backend == "LEGACY":
+            flags = 0 if down else win32con.KEYEVENTF_KEYUP
+            win32api.keybd_event(int(vk), 0, flags, 0)
+            return
+
+        user32 = ctypes.windll.user32
+        if backend == "MESSAGE":
+            if hwnd is None or not win32gui.IsWindow(int(hwnd)):
+                raise DesktopBridgeError("MESSAGE Game Mode backend requires a valid game window handle.")
+            scan = int(user32.MapVirtualKeyW(int(vk), 0))
+            lparam = 1 | (scan << 16)
+            message = win32con.WM_KEYDOWN if down else win32con.WM_KEYUP
+            if not down:
+                lparam |= (1 << 30) | (1 << 31)
+            win32gui.PostMessage(int(hwnd), message, int(vk), int(lparam))
+            return
+
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+        KEYEVENTF_SCANCODE = 0x0008
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_ushort),
+                ("wParamH", ctypes.c_ushort),
+            ]
+
+        class INPUTUNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("union",)
+            _fields_ = [("type", ctypes.c_ulong), ("union", INPUTUNION)]
+
+        if backend == "SCAN":
+            scan = int(user32.MapVirtualKeyW(int(vk), 0))
+            if scan <= 0:
+                raise DesktopBridgeError(f"Could not map virtual key {vk} to a scan code.")
+            flags = KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if not down else 0)
+            keyboard = KEYBDINPUT(0, scan, flags, 0, 0)
+        else:  # VK
+            flags = KEYEVENTF_KEYUP if not down else 0
+            keyboard = KEYBDINPUT(int(vk), 0, flags, 0, 0)
+
+        event = INPUT(type=INPUT_KEYBOARD, ki=keyboard)
+        if user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) != 1:
+            raise DesktopBridgeError(f"Windows SendInput failed for Game Mode backend {backend}.")
+
+    @_operation_scoped
+    def press_key(self, key: str) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="press_key")
+        raw = key.strip().upper()
+        if not raw:
+            raise DesktopBridgeError("Key must not be empty.")
+
+        # Backward-compatible Game Mode for already-scanned MCP clients.
+        # Examples: W, W:800, W+SHIFT:600, SCAN|W:500, VK|F2,
+        # LEGACY|SPACE:80, MESSAGE|F2.
+        match = re.fullmatch(
+            r"(?:(SCAN|VK|LEGACY|MESSAGE)\|)?([A-Z0-9]+(?:\+[A-Z0-9]+){0,3})(?::(\d{1,4}))?",
+            raw,
+        )
+        if match:
+            backend = self._normalize_game_backend(match.group(1))
+            pieces = match.group(2).split("+")
+            duration_ms = int(match.group(3) or 70)
+            game_candidate = all(piece in SAFE_GAME_KEYS for piece in pieces)
+            explicit_game_syntax = ":" in raw or "+" in raw or raw not in SAFE_KEYS
+            active_is_game = False
+            if game_candidate and not explicit_game_syntax:
+                try:
+                    active_is_game = "zenlesszonezero" in self.active_window().title.casefold()
+                except DesktopBridgeError:
+                    active_is_game = False
+            if game_candidate and (explicit_game_syntax or active_is_game):
+                self._require_permission_tier("elevated_input", action="game_press_key_compat")
+                window = self._require_foreground_title("ZenlessZoneZero")
+                duration_ms = max(20, min(3000, duration_ms))
+                pressed: list[str] = []
+                try:
+                    for piece in pieces:
+                        if piece in pressed:
+                            continue
+                        self._send_game_vk(SAFE_GAME_KEYS[piece], True, backend, hwnd=window.hwnd)
+                        pressed.append(piece)
+                    time.sleep(duration_ms / 1000.0)
+                finally:
+                    for piece in reversed(pressed):
+                        self._send_game_vk(SAFE_GAME_KEYS[piece], False, backend, hwnd=window.hwnd)
+                return {
+                    "status": "ok",
+                    "action": "game_press_key_compat",
+                    "keys": pressed,
+                    "duration_ms": duration_ms,
+                    "backend": backend,
+                    "window": window.title,
+                }
+
+        normalized = raw
+        if normalized not in SAFE_KEYS:
+            raise DesktopBridgeError(
+                "Unsupported key. Allowed desktop keys: " + ", ".join(sorted(SAFE_KEYS))
+            )
+        vk = SAFE_KEYS[normalized]
+        self._send_vk(vk, True)
+        self._send_vk(vk, False)
+        return {"status": "ok", "action": "press_key", "key": normalized}
+
+    @staticmethod
+    def _normalize_game_key(key: str) -> str:
+        normalized = key.strip().upper()
+        aliases = {" ": "SPACE", "SPACEBAR": "SPACE", "LSHIFT": "SHIFT", "RSHIFT": "SHIFT"}
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in SAFE_GAME_KEYS:
+            raise DesktopBridgeError(
+                "Unsupported Game Mode key. Allowed: " + ", ".join(sorted(SAFE_GAME_KEYS))
+            )
+        return normalized
+
+    def _require_foreground_title(self, expected_window_title: str) -> DesktopWindow:
+        return self._require_active_title(expected_window_title)
+
+    @_operation_scoped
+    def game_key_down(
+        self,
+        key: str,
+        expected_window_title: str,
+        backend: str = DEFAULT_GAME_INPUT_BACKEND,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("elevated_input", action="game_key_down")
+        normalized = self._normalize_game_key(key)
+        backend = self._normalize_game_backend(backend)
+        if backend == "MESSAGE":
+            raise DesktopBridgeError("MESSAGE backend supports bounded tap/hold calls only, not persistent key-down.")
+        window = self._require_foreground_title(expected_window_title)
+        self._send_game_vk(SAFE_GAME_KEYS[normalized], True, backend, hwnd=window.hwnd)
+        _GAME_KEYS_DOWN.add((normalized, backend))
+        return {
+            "status": "ok",
+            "action": "game_key_down",
+            "key": normalized,
+            "backend": backend,
+            "window": window.title,
+        }
+
+    @_operation_scoped
+    def game_key_up(self, key: str, backend: str = DEFAULT_GAME_INPUT_BACKEND) -> dict[str, Any]:
+        self._require_permission_tier("elevated_input", action="game_key_up")
+        normalized = self._normalize_game_key(key)
+        backend = self._normalize_game_backend(backend)
+        if backend == "MESSAGE":
+            raise DesktopBridgeError("MESSAGE backend does not support standalone key-up without a target window.")
+        self._send_game_vk(SAFE_GAME_KEYS[normalized], False, backend)
+        _GAME_KEYS_DOWN.discard((normalized, backend))
+        return {"status": "ok", "action": "game_key_up", "key": normalized, "backend": backend}
+
+    @_operation_scoped
+    def tap_game_key(
+        self,
+        key: str,
+        expected_window_title: str,
+        duration_ms: int = 60,
+        backend: str = DEFAULT_GAME_INPUT_BACKEND,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("elevated_input", action="tap_game_key")
+        normalized = self._normalize_game_key(key)
+        backend = self._normalize_game_backend(backend)
+        window = self._require_foreground_title(expected_window_title)
+        duration_ms = max(20, min(1000, int(duration_ms)))
+        vk = SAFE_GAME_KEYS[normalized]
+        self._send_game_vk(vk, True, backend, hwnd=window.hwnd)
+        try:
+            time.sleep(duration_ms / 1000.0)
+        finally:
+            self._send_game_vk(vk, False, backend, hwnd=window.hwnd)
+            _GAME_KEYS_DOWN.discard((normalized, backend))
+        return {
+            "status": "ok",
+            "action": "tap_game_key",
+            "key": normalized,
+            "duration_ms": duration_ms,
+            "backend": backend,
+            "window": window.title,
+        }
+
+    @_operation_scoped
+    def hold_game_keys(
+        self,
+        keys: list[str],
+        expected_window_title: str,
+        duration_ms: int = 500,
+        backend: str = DEFAULT_GAME_INPUT_BACKEND,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("elevated_input", action="hold_game_keys")
+        if not keys:
+            raise DesktopBridgeError("Provide at least one Game Mode key.")
+        normalized_keys: list[str] = []
+        for key in keys:
+            normalized = self._normalize_game_key(key)
+            if normalized not in normalized_keys:
+                normalized_keys.append(normalized)
+        if len(normalized_keys) > 4:
+            raise DesktopBridgeError("At most 4 Game Mode keys may be held together.")
+        backend = self._normalize_game_backend(backend)
+        window = self._require_foreground_title(expected_window_title)
+        duration_ms = max(20, min(3000, int(duration_ms)))
+        pressed: list[str] = []
+        try:
+            for normalized in normalized_keys:
+                self._send_game_vk(SAFE_GAME_KEYS[normalized], True, backend, hwnd=window.hwnd)
+                if backend != "MESSAGE":
+                    _GAME_KEYS_DOWN.add((normalized, backend))
+                pressed.append(normalized)
+            time.sleep(duration_ms / 1000.0)
+        finally:
+            for normalized in reversed(pressed):
+                self._send_game_vk(SAFE_GAME_KEYS[normalized], False, backend, hwnd=window.hwnd)
+                _GAME_KEYS_DOWN.discard((normalized, backend))
+        return {
+            "status": "ok",
+            "action": "hold_game_keys",
+            "keys": normalized_keys,
+            "duration_ms": duration_ms,
+            "backend": backend,
+            "window": window.title,
+        }
+
+    @_operation_scoped(permission_decision_required=False)
+    def release_game_keys(self) -> dict[str, Any]:
+        # Key-up is safe to send globally and intentionally does not require the
+        # game to still be foreground, so this remains useful after an Alt+Tab.
+        released = sorted(_GAME_KEYS_DOWN)
+        for backend in sorted(GAME_INPUT_BACKENDS - {"MESSAGE"}):
+            for _, vk in SAFE_GAME_KEYS.items():
+                self._send_game_vk(vk, False, backend)
+        _GAME_KEYS_DOWN.clear()
+        return {
+            "status": "ok",
+            "action": "release_game_keys",
+            "tracked_released": [[key, backend] for key, backend in released],
+        }
+
+    @_operation_scoped
+    def tap_game_mouse(
+        self,
+        button: str,
+        expected_window_title: str,
+        clicks: int = 1,
+        interval_ms: int = 80,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("elevated_input", action="tap_game_mouse")
+        button = button.strip().lower()
+        if button not in {"left", "right"}:
+            raise DesktopBridgeError("Game mouse button must be 'left' or 'right'.")
+        window = self._require_foreground_title(expected_window_title)
+        clicks = max(1, min(12, int(clicks)))
+        interval_ms = max(30, min(500, int(interval_ms)))
+        down_flag, up_flag = (
+            (win32con.MOUSEEVENTF_LEFTDOWN, win32con.MOUSEEVENTF_LEFTUP)
+            if button == "left"
+            else (win32con.MOUSEEVENTF_RIGHTDOWN, win32con.MOUSEEVENTF_RIGHTUP)
+        )
+        for index in range(clicks):
+            win32api.mouse_event(down_flag, 0, 0, 0, 0)
+            win32api.mouse_event(up_flag, 0, 0, 0, 0)
+            if index + 1 < clicks:
+                time.sleep(interval_ms / 1000.0)
+        return {
+            "status": "ok",
+            "action": "tap_game_mouse",
+            "button": button,
+            "clicks": clicks,
+            "interval_ms": interval_ms,
+            "window": window.title,
+        }
+
+    @_operation_scoped
+    def hold_game_mouse(
+        self,
+        button: str,
+        expected_window_title: str,
+        duration_ms: int = 400,
+    ) -> dict[str, Any]:
+        self._require_permission_tier("elevated_input", action="hold_game_mouse")
+        button = button.strip().lower()
+        if button not in {"left", "right"}:
+            raise DesktopBridgeError("Game mouse button must be 'left' or 'right'.")
+        window = self._require_foreground_title(expected_window_title)
+        duration_ms = max(20, min(2000, int(duration_ms)))
+        down_flag, up_flag = (
+            (win32con.MOUSEEVENTF_LEFTDOWN, win32con.MOUSEEVENTF_LEFTUP)
+            if button == "left"
+            else (win32con.MOUSEEVENTF_RIGHTDOWN, win32con.MOUSEEVENTF_RIGHTUP)
+        )
+        win32api.mouse_event(down_flag, 0, 0, 0, 0)
+        try:
+            time.sleep(duration_ms / 1000.0)
+        finally:
+            win32api.mouse_event(up_flag, 0, 0, 0, 0)
+        return {
+            "status": "ok",
+            "action": "hold_game_mouse",
+            "button": button,
+            "duration_ms": duration_ms,
+            "window": window.title,
+        }
+
+    @_operation_scoped
+    def hotkey(self, combo: str) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="hotkey")
+        normalized = re.sub(r"\s+", "", combo).upper()
+        if normalized not in SAFE_HOTKEYS:
+            raise DesktopBridgeError("Unsupported hotkey. Allowed: " + ", ".join(sorted(SAFE_HOTKEYS)))
+        keys = SAFE_HOTKEYS[normalized]
+        for vk in keys:
+            self._send_vk(vk, True)
+        for vk in reversed(keys):
+            self._send_vk(vk, False)
+        return {"status": "ok", "action": "hotkey", "hotkey": normalized}
+
+    @_operation_scoped
+    def type_text(self, text: str, *, _before_chunk: Callable[[], None] | None = None) -> dict[str, Any]:
+        self._require_permission_tier("interact", action="type_text")
+        try:
+            chunks = plan_text_chunks(text)
+        except ValueError as exc:
+            raise DesktopBridgeError(str(exc)) from exc
+
+        user32 = ctypes.windll.user32
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_UNICODE = 0x0004
+        KEYEVENTF_KEYUP = 0x0002
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_ushort),
+                ("wParamH", ctypes.c_ushort),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("union",)
+            _fields_ = [("type", ctypes.c_ulong), ("union", INPUT_UNION)]
+
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            if _before_chunk is not None:
+                _before_chunk()
+            pending: list[INPUT] = []
+            pending_units = 0
+
+            def flush() -> None:
+                nonlocal pending_units
+                if not pending:
+                    return
+                events = (INPUT * len(pending))(*pending)
+                accepted = user32.SendInput(len(events), events, ctypes.sizeof(INPUT))
+                if accepted != len(events):
+                    raise DesktopBridgeError(
+                        f"Desktop text input failed during chunk {chunk_index}/{len(chunks)}; "
+                        "insertion may be partial and was not retried."
+                    )
+                pending.clear()
+                pending_units = 0
+                time.sleep(SENDINPUT_BATCH_PAUSE_SECONDS)
+
+            offset = 0
+            while offset < len(chunk):
+                codepoint = ord(chunk[offset])
+                if (0xD800 <= codepoint <= 0xDBFF and offset + 1 < len(chunk)
+                        and 0xDC00 <= ord(chunk[offset + 1]) <= 0xDFFF):
+                    units = (codepoint, ord(chunk[offset + 1]))
+                    offset += 2
+                elif codepoint > 0xFFFF:
+                    units = (0xD800 + ((codepoint - 0x10000) >> 10),
+                             0xDC00 + ((codepoint - 0x10000) & 0x3FF))
+                    offset += 1
+                else:
+                    units = (codepoint,)
+                    offset += 1
+                if pending_units + len(units) > SENDINPUT_BATCH_UTF16_UNITS:
+                    flush()
+                for unit in units:
+                    pending.append(INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)))
+                    pending.append(INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)))
+                pending_units += len(units)
+            flush()
+        return {
+            "status": "ok", "action": "type_text", "characters": len(text),
+            "chunk_count": len(chunks), "chunk_size_policy": UI_TEXT_CHUNK_CHARS,
+            "logical_max_chars": LOGICAL_TEXT_MAX_CHARS,
+        }
+
+    def cursor_position(self) -> dict[str, int]:
+        x, y = win32api.GetCursorPos()
+        return {"x": int(x), "y": int(y)}
