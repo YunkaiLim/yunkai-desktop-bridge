@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "provider": "ollama",
+  "model": "huihui_ai/qwen2.5-vl-abliterated:7b",
+  "base_url": "http://127.0.0.1:11434",
+  "timeout_seconds": 30,
+  "max_image_edge": 960,
+  "min_action_confidence": 0.85,
+  "context_window": 4096,
+  "max_output_tokens": 512
+}
