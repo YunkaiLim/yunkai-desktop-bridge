@@ -62,7 +62,7 @@ From `DesktopBridge/`:
 python -m unittest
 ```
 
-The private working tree passed its current unit suite before this public export. The public repository is a source export, not a claim that every Windows build or MCP host has been acceptance-tested.
+The selected source mirrors the private working tree at publication time. Run the included unit suite in your target Windows environment; this public repository is a source export, not a claim that every Windows build or MCP host has been acceptance-tested.
 
 ## Security model
 
