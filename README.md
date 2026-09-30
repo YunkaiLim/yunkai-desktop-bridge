@@ -62,7 +62,7 @@ From `DesktopBridge/`:
 python -m unittest
 ```
 
-During public-release preparation on 2026-09-30, the selected public test set passed **95 tests**, including stdio MCP discovery and screenshot/content checks.
+During public-release preparation on 2026-09-30, the selected public test set passed **104 tests**, including stdio MCP discovery and screenshot/content checks.
 
 A passing unit suite is not proof of live acceptance on every Windows build or MCP host. Perform target-machine acceptance separately.
 
