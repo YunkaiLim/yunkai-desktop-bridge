@@ -12,7 +12,7 @@ class SecretVaultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vault.json"
             vault = SecretVault(path)
-            secret = "sk-test-super-sensitive-value-123"
+            secret = "dummy-test-super-sensitive-value-123"
             vault.set_secret("openai_runtime", secret)
             self.assertEqual(vault.get_secret("openai_runtime"), secret)
             raw = path.read_text(encoding="utf-8")
@@ -22,7 +22,7 @@ class SecretVaultTests(unittest.TestCase):
     def test_target_binding_is_required_and_exact(self):
         with tempfile.TemporaryDirectory() as directory:
             vault = SecretVault(Path(directory) / "vault.json")
-            vault.set_secret("openai_runtime", "sk-test-123")
+            vault.set_secret("openai_runtime", "dummy-test-123")
             with self.assertRaises(SecretVaultError):
                 vault.resolve_for_target(
                     "openai_runtime",
@@ -40,7 +40,7 @@ class SecretVaultTests(unittest.TestCase):
                     window_title="ChatGPT",
                     name="Runtime API key",
                 ),
-                "sk-test-123",
+                "dummy-test-123",
             )
             with self.assertRaises(SecretVaultError):
                 vault.resolve_for_target(
