@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yunkai.local/schemas/unified-device-contract-v0.1.json",
+  "title": "Yunkai Unified Device Contract v0.1 DeviceSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract",
+    "device",
+    "adapter",
+    "contract_versions",
+    "capability_manifest",
+    "capability_state",
+    "permission_state",
+    "runtime_policy",
+    "planner_routing_hints",
+    "verification",
+    "observability",
+    "safety_invariants"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "schema_version"],
+      "properties": {
+        "id": { "const": "yunkai.unified_device_contract" },
+        "version": { "const": "0.1" },
+        "schema_version": { "const": 1 }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "device_class", "platform", "display_name", "adapter_version"],
+      "properties": {
+        "device_id": { "$ref": "#/$defs/dottedId" },
+        "device_class": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "platform": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "adapter_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "required": ["role", "transport", "transport_is_device_identity"],
+      "properties": {
+        "role": { "type": "string", "minLength": 1 },
+        "transport": { "type": "string", "minLength": 1 },
+        "transport_is_device_identity": { "const": false }
+      }
+    },
+    "contract_versions": {
+      "type": "object",
+      "required": [
+        "device_contract",
+        "capability_manifest",
+        "capability_state",
+        "permission_state",
+        "planner_routing",
+        "verification",
+        "runtime_policy"
+      ],
+      "properties": {
+        "device_contract": { "const": 1 },
+        "capability_manifest": { "const": 1 },
+        "capability_state": { "const": 1 },
+        "permission_state": { "const": 1 },
+        "planner_routing": { "const": 1 },
+        "verification": { "type": "integer", "minimum": 1 },
+        "runtime_policy": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "capability_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "device_id", "namespace", "capability_groups", "capabilities", "feature_flags"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "device_id": { "$ref": "#/$defs/dottedId" },
+        "namespace": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "capability_groups": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/dottedId" },
+            "uniqueItems": true
+          }
+        },
+        "capabilities": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["group"],
+            "properties": { "group": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "feature_flags": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
+    },
+    "capability_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "device_id",
+        "availability_values",
+        "availability_independent_from_permission",
+        "states",
+        "summary",
+        "adapter_context"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "device_id": { "$ref": "#/$defs/dottedId" },
+        "availability_values": {
+          "const": ["available", "degraded", "unavailable"]
+        },
+        "availability_independent_from_permission": { "const": true },
+        "states": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/capabilityState" }
+        },
+        "summary": { "$ref": "#/$defs/availabilitySummary" },
+        "adapter_context": { "type": "object" }
+      }
+    },
+    "permission_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "device_id", "permission_values", "separate_from_availability", "states", "summary"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "device_id": { "$ref": "#/$defs/dottedId" },
+        "permission_values": { "const": ["allowed", "denied", "unknown"] },
+        "separate_from_availability": { "const": true },
+        "states": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/permissionState" }
+        },
+        "summary": { "$ref": "#/$defs/permissionSummary" }
+      }
+    },
+    "runtime_policy": {
+      "type": "object",
+      "required": ["schema_version", "runtime_profile", "allowed_tiers", "model_selectable_profile", "self_escalation"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "runtime_profile": { "type": "string", "minLength": 1 },
+        "allowed_tiers": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "model_selectable_profile": { "const": false },
+        "self_escalation": { "const": false }
+      }
+    },
+    "planner_routing_hints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "device_id",
+        "advisory_only",
+        "planner_owns_final_selection",
+        "bridge_auto_executes",
+        "automatic_fallback_execution",
+        "permission_bypass_allowed",
+        "routing_inputs",
+        "summary",
+        "routes"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "device_id": { "$ref": "#/$defs/dottedId" },
+        "advisory_only": { "const": true },
+        "planner_owns_final_selection": { "const": true },
+        "bridge_auto_executes": { "const": false },
+        "automatic_fallback_execution": { "const": false },
+        "permission_bypass_allowed": { "const": false },
+        "routing_inputs": { "type": "object" },
+        "summary": { "$ref": "#/$defs/routingSummary" },
+        "routes": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/route" }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "required": ["supported", "automatic_retry"],
+      "properties": {
+        "supported": { "type": "boolean" },
+        "automatic_retry": { "const": false }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["audit", "operation_trace"],
+      "properties": {
+        "audit": { "$ref": "#/$defs/supportMetadata" },
+        "operation_trace": { "$ref": "#/$defs/supportMetadata" }
+      }
+    },
+    "safety_invariants": {
+      "type": "object",
+      "required": [
+        "planner_owns_final_selection",
+        "bridge_auto_executes",
+        "automatic_fallback_execution",
+        "permission_bypass_allowed",
+        "contract_grants_action_authority"
+      ],
+      "properties": {
+        "planner_owns_final_selection": { "const": true },
+        "bridge_auto_executes": { "const": false },
+        "automatic_fallback_execution": { "const": false },
+        "permission_bypass_allowed": { "const": false },
+        "contract_grants_action_authority": { "const": false }
+      }
+    }
+  },
+  "$defs": {
+    "dottedId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "capabilityState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability", "reason_code", "reason", "basis"],
+      "properties": {
+        "availability": { "enum": ["available", "degraded", "unavailable"] },
+        "reason_code": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "basis": { "type": "string", "minLength": 1 }
+      }
+    },
+    "permissionState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_tier", "state", "runtime_profile"],
+      "properties": {
+        "required_tier": { "type": "string", "minLength": 1 },
+        "state": { "enum": ["allowed", "denied", "unknown"] },
+        "runtime_profile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "availabilitySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "degraded", "unavailable", "total"],
+      "properties": {
+        "available": { "type": "integer", "minimum": 0 },
+        "degraded": { "type": "integer", "minimum": 0 },
+        "unavailable": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "permissionSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "denied", "unknown", "total"],
+      "properties": {
+        "allowed": { "type": "integer", "minimum": 0 },
+        "denied": { "type": "integer", "minimum": 0 },
+        "unknown": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "routingSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ready", "degraded", "blocked", "total"],
+      "properties": {
+        "ready": { "type": "integer", "minimum": 0 },
+        "degraded": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "preferred_strategy", "reason_code", "reason", "capability_steps", "fallbacks", "constraints"],
+      "properties": {
+        "status": { "enum": ["ready", "degraded", "blocked"] },
+        "preferred_strategy": { "type": "string", "minLength": 1 },
+        "reason_code": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "capability_steps": { "type": "array", "items": { "$ref": "#/$defs/dottedId" } },
+        "fallbacks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["capability_steps"],
+            "properties": {
+              "capability_steps": { "type": "array", "items": { "$ref": "#/$defs/dottedId" } }
+            }
+          }
+        },
+        "constraints": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "supportMetadata": {
+      "type": "object",
+      "required": ["supported"],
+      "properties": { "supported": { "type": "boolean" } }
+    }
+  }
+}
