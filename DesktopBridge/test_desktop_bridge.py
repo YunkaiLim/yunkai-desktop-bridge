@@ -840,7 +840,7 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def test_secure_secret_input_can_target_password_field_without_logging_secret(self):
         reset_action_audit_for_tests()
-        secret = "sk-test-never-log-this-value"
+        secret = "dummy-test-never-log-this-value"
         bridge = FakeUIABridge(
             [
                 {
