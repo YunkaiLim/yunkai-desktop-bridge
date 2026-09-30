@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yunkai.local/schemas/verification-contract-v1.json",
+  "title": "Yunkai Shared Verification Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "decision",
+    "verification_policy",
+    "policy_passed",
+    "postconditions_configured",
+    "postconditions_passed",
+    "verification_passed",
+    "retry_performed",
+    "policy",
+    "postconditions"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "decision": {"enum": ["pass", "fail"]},
+    "verification_policy": {
+      "enum": [
+        "any_confident_change",
+        "semantic_or_window",
+        "semantic_only",
+        "window_only",
+        "visual_only"
+      ]
+    },
+    "policy_passed": {"type": "boolean"},
+    "postconditions_configured": {"type": "boolean"},
+    "postconditions_passed": {"type": "boolean"},
+    "verification_passed": {"type": "boolean"},
+    "retry_performed": {"const": false},
+    "policy": {"$ref": "#/$defs/policyResult"},
+    "postconditions": {"$ref": "#/$defs/postconditionResult"}
+  },
+  "$defs": {
+    "signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state_change_detected",
+        "semantic_changed",
+        "surface_identity_changed",
+        "visual_change_confident"
+      ],
+      "properties": {
+        "state_change_detected": {"type": "boolean"},
+        "semantic_changed": {"type": "boolean"},
+        "surface_identity_changed": {"type": "boolean"},
+        "visual_change_confident": {"type": "boolean"}
+      }
+    },
+    "policyResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "schema_version",
+        "verification_policy",
+        "policy_passed",
+        "policy_reason",
+        "signals"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "verification_policy": {
+          "enum": [
+            "any_confident_change",
+            "semantic_or_window",
+            "semantic_only",
+            "window_only",
+            "visual_only"
+          ]
+        },
+        "policy_passed": {"type": "boolean"},
+        "policy_reason": {"type": "string", "maxLength": 300},
+        "signals": {"$ref": "#/$defs/signals"}
+      }
+    },
+    "postconditionCheck": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind", "passed"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1, "maxLength": 100},
+        "passed": {"type": "boolean"}
+      }
+    },
+    "postconditionResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["configured", "postconditions_passed", "checks"],
+      "properties": {
+        "configured": {"type": "boolean"},
+        "postconditions_passed": {"type": "boolean"},
+        "checks": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {"$ref": "#/$defs/postconditionCheck"}
+        }
+      }
+    }
+  }
+}
