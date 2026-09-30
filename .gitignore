@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+*.log
+*.bak
+*.tmp
+desktopbridge_tunnel_id.txt
+desktopbridge_vision.json
+runtime/
+.runtime/
+.local/
