@@ -2,7 +2,7 @@
 
 A local-first Windows MCP bridge for guarded desktop perception and interaction.
 
-This repository is a sanitized public-source export of the DesktopBridge used in the Yunkai project. It intentionally keeps the safety boundaries that matter: semantic/read-only inspection first, bounded input actions, local runtime policy, deterministic verification, metadata-only action audit, and no arbitrary shell.
+This repository is a sanitized public-source export of the DesktopBridge used in the Yunkai project. It keeps the control boundaries that matter: semantic/read-only inspection first, bounded input actions, local runtime policy, deterministic verification, metadata-only action audit, and no arbitrary shell.
 
 ## Highlights
 
@@ -22,14 +22,14 @@ The public MCP surface does not expose arbitrary shell/PowerShell/cmd execution,
 
 ## Public export boundary
 
-This repository does **not** contain private tunnel IDs, runtime credentials, owner-specific configuration, caches, backups, local verification evidence, or tunnel-client binaries. Secure-tunnel/autostart wrappers from the private workspace are also omitted from this first public source release.
+This repository does **not** contain private tunnel IDs, runtime credentials, owner-specific configuration, caches, backups, local verification evidence, or tunnel-client binaries. Machine-specific DevSpace routing code is intentionally excluded from this public bridge.
 
 The shared contract modules required by the bridge are included under `yunkai_shared/`.
 
 ## Requirements
 
 - Windows 10/11
-- Python 3.11+
+- Python 3.10+
 - Microsoft UI Automation (built into Windows)
 - Python dependencies in `requirements.txt`
 
@@ -45,7 +45,7 @@ cd DesktopBridge
 python server_stdio.py
 ```
 
-For the local HTTP entry point used by the original bridge:
+For the local HTTP entry point:
 
 ```powershell
 cd DesktopBridge
@@ -62,14 +62,18 @@ From `DesktopBridge/`:
 python -m unittest
 ```
 
-The selected source mirrors the private working tree at publication time. Run the included unit suite in your target Windows environment; this public repository is a source export, not a claim that every Windows build or MCP host has been acceptance-tested.
+During public-release preparation on 2026-09-30, the selected public test set passed **95 tests**, including stdio MCP discovery and screenshot/content checks.
+
+A passing unit suite is not proof of live acceptance on every Windows build or MCP host. Perform target-machine acceptance separately.
 
 ## Security model
 
-Read `SECURITY.md` before enabling side-effecting tools. Keep runtime permissions local, preserve foreground-window and semantic-target guards, and do not remove verification to reduce latency.
+Read `SECURITY.md` before enabling side-effecting tools. Keep runtime permissions local, preserve foreground-window and semantic-target guards, and do not remove verification simply to reduce latency.
 
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE`.
+
+Third-party components are not relicensed by this repository; see `THIRD_PARTY_NOTICES.md`.
 
 This project is independent source code and is not an official OpenAI product.
